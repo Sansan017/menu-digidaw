@@ -201,6 +201,8 @@ label.btn{display:inline-flex;align-items:center;cursor:pointer}
 .mhead select.mi-icon{width:104px;flex:none;padding:12px 8px;border:1.5px solid var(--border);border-radius:14px;background:var(--bg);color:var(--text);font-size:14px;font-weight:600}
 
 @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+input[type=date]{width:100%;padding:13px 14px;border:1.5px solid var(--border);border-radius:14px;background:var(--bg);color:var(--text);font-size:16px;outline:0}
+input[type=date]:focus{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-light)}
 </style>
 </head>
 <body>
@@ -269,6 +271,9 @@ const rp = (n) => "Rp" + Number(n).toLocaleString("id-ID");
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const ms = (v) => (v && typeof v.toMillis === "function" ? v.toMillis() : typeof v === "number" ? v : Date.now());
 const hhmm = (v) => new Date(ms(v)).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
+// Awal "hari kerja" kasir: pukul 00.00 hari ini (sebelum jam 04.00 dihitung masih hari kemarin).
+const bizStart = () => { const d = new Date(); if (d.getHours() < 4) d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0); return d.getTime(); };
+const dateStr = (d) => d.toLocaleDateString("sv-SE");
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage tidak tersedia */ } },
@@ -547,11 +552,14 @@ function localBackend(note) {
       return () => subs.delete(f);
     },
     watchOrders(cb) {
-      const f = () => cb(read().sort((a, b) => b.createdAt - a.createdAt));
+      const f = () => cb(read().filter((o) => ms(o.createdAt) >= bizStart()).sort((a, b) => ms(b.createdAt) - ms(a.createdAt)));
       subs.add(f); f();
       return () => subs.delete(f);
     },
     async updateOrder(id, patch) { write(read().map((o) => (o.id === id ? { ...o, ...patch } : o))); },
+    async fetchOrders(start, end, max = 1000) {
+      return read().filter((o) => ms(o.createdAt) >= start && ms(o.createdAt) < end).sort((a, b) => ms(b.createdAt) - ms(a.createdAt)).slice(0, max);
+    },
     watchMenu(cb) {
       const f = () => { let m = null; try { m = JSON.parse(store.get(MKEY) || "null"); } catch { m = null; } cb(m); };
       msubs.add(f); f();
@@ -591,10 +599,16 @@ async function createBackend() {
         return fs.onSnapshot(fs.doc(db, "orders", id), (s) => cb(s.exists() ? withId(s) : null), onErr);
       },
       watchOrders(cb, onErr) {
-        const q = fs.query(col, fs.orderBy("createdAt", "desc"), fs.limit(150));
+        // Hanya pesanan hari ini yang dipantau realtime (hemat kuota baca). Riwayat dibuka lewat tab Riwayat.
+        const q = fs.query(col, fs.where("createdAt", ">=", fs.Timestamp.fromMillis(bizStart())), fs.orderBy("createdAt", "desc"), fs.limit(300));
         return fs.onSnapshot(q, (s) => cb(s.docs.map(withId)), onErr);
       },
       updateOrder(id, patch) { return fs.updateDoc(fs.doc(db, "orders", id), patch); },
+      async fetchOrders(start, end, max = 1000) {
+        const q = fs.query(col, fs.where("createdAt", ">=", fs.Timestamp.fromMillis(start)), fs.where("createdAt", "<", fs.Timestamp.fromMillis(end)), fs.orderBy("createdAt", "desc"), fs.limit(max));
+        const snap = await fs.getDocs(q);
+        return snap.docs.map(withId);
+      },
       watchMenu(cb, onErr) {
         return fs.onSnapshot(fs.doc(db, "config", "menu"), (s) => cb(s.exists() ? s.data().categories || null : null), onErr);
       },
@@ -1005,10 +1019,11 @@ function initCustomer() {
 const K = {
   orders: [], tab: "aktif", sound: true, seen: null, unsub: null, authed: false, error: "",
   menu: [], menuInDb: null, menuUnsub: null, editId: "", settings: normalizeSettings(null), setUnsub: null, stQris: "",
-  qr: { base: "", n: 10 }
+  qr: { base: "", n: 10 },
+  hist: { date: dateStr(new Date()), orders: null, loading: false, err: "", seq: 0 }
 };
 const kasir = $("#kasir");
-const EDIT_TABS = ["menu", "pengaturan", "qr"];
+const EDIT_TABS = ["riwayat", "menu", "pengaturan", "qr"];
 const MENU_ACTS = ["edit", "sold", "delitem", "additem", "delcat", "addcat", "delphoto"];
 
 function beep() {
@@ -1311,6 +1326,120 @@ function qrHtml() {
 }
 
 /* ---- Tampilan utama kasir ---- */
+/* ---- Riwayat, rekap, dan ekspor ---- */
+function sumOrders(list) {
+  const valid = list.filter((o) => o.paid && o.status !== "batal");
+  const byMethod = {};
+  const items = {};
+  let omzet = 0;
+  valid.forEach((o) => {
+    omzet += o.total || 0;
+    byMethod[o.method] = (byMethod[o.method] || 0) + (o.total || 0);
+    (o.items || []).forEach((i) => { items[i.name] = (items[i.name] || 0) + (i.qty || 0); });
+  });
+  return {
+    omzet, paidCount: valid.length,
+    batal: list.filter((o) => o.status === "batal").length,
+    unpaid: list.filter((o) => !o.paid && o.status !== "batal").length,
+    byMethod,
+    top: Object.entries(items).sort((a, b) => b[1] - a[1]).slice(0, 5)
+  };
+}
+
+function histCardHtml(o) {
+  const st = o.status || "baru";
+  return `<div class="card"><div class="ohead"><span>#${esc(String(o.id).slice(-4).toUpperCase())} · ${esc(o.name)}${o.table ? ` · Meja ${esc(o.table)}` : ""}</span><span class="muted">${hhmm(o.createdAt)}</span></div>
+    <div style="margin:6px 0">${(o.items || []).map((i) => `<div class="ln"><span>${i.qty}× ${esc(i.name)}</span><span>${rp(i.price * i.qty)}</span></div>`).join("")}<div class="ln tot"><span>Total</span><span>${rp(o.total)}</span></div></div>
+    <span class="pill ${st === "batal" ? "bad" : st === "selesai" ? "ok" : "warn"}">${esc(STATUS[st] || st)}</span>
+    <span class="pill ${o.paid ? "ok" : "bad"}">${o.paid ? "Lunas" : "Belum bayar"}</span>
+    <span class="pill ok" style="background:var(--chip);color:var(--text)">${esc(METHODS[o.method] || o.method)}</span></div>`;
+}
+
+function histHtml() {
+  const h = K.hist;
+  let body = "";
+  if (h.loading) body = `<div class="empty">Memuat...</div>`;
+  else if (h.err) body = `<div class="banner">${esc(h.err)}</div>`;
+  else if (h.orders && !h.orders.length) body = `<div class="empty">Tidak ada pesanan pada tanggal ini.</div>`;
+  else if (h.orders) {
+    const r = sumOrders(h.orders);
+    const methodLines = Object.keys(METHODS).filter((k) => r.byMethod[k]).map((k) => `<div class="ln"><span>${esc(METHODS[k])}</span><span>${rp(r.byMethod[k])}</span></div>`).join("") || `<div class="muted">Belum ada pembayaran lunas.</div>`;
+    const topLines = r.top.length ? r.top.map(([n, q]) => `<div class="ln"><span>${esc(n)}</span><span>${q}×</span></div>`).join("") : `<div class="muted">-</div>`;
+    body = `<div class="stats"><div class="stat">Omzet lunas<b>${rp(r.omzet)}</b></div><div class="stat">Pesanan lunas<b>${r.paidCount}</b></div><div class="stat">Dibatalkan<b>${r.batal}</b></div></div>
+      ${r.unpaid ? `<div class="banner">Ada ${r.unpaid} pesanan yang belum dibayar dan tidak masuk omzet.</div>` : ""}
+      <div class="card"><h2 style="margin:0 0 4px">Per metode bayar</h2>${methodLines}</div>
+      <div class="card"><h2 style="margin:0 0 4px">Menu terlaris</h2>${topLines}</div>
+      <div class="acts" style="margin-top:12px"><button class="btn sm ghost" data-act="csvday">Ekspor CSV tanggal ini</button><button class="btn sm ghost" data-act="csvmonth">Ekspor CSV sebulan</button></div>
+      <h2>Daftar pesanan (${h.orders.length})</h2>${h.orders.map(histCardHtml).join("")}`;
+  }
+  return `<div class="muted" style="margin-bottom:8px">Rekap dihitung langsung dari data pesanan, jadi selalu cocok dengan catatan kasir. Omzet hanya menghitung pesanan yang sudah lunas dan tidak dibatalkan.</div>
+    <div class="frow"><label class="f" style="flex:1">Tanggal<input id="histDate" type="date" value="${esc(h.date)}" max="${dateStr(new Date())}"></label>
+    <button class="btn sm ghost" style="align-self:flex-end" data-act="histload">Muat ulang</button></div>
+    ${body}`;
+}
+
+async function loadHist() {
+  const h = K.hist;
+  const seq = ++h.seq;
+  h.loading = true; h.err = "";
+  if (K.tab === "riwayat") renderKasir();
+  try {
+    const [y, m, d] = h.date.split("-").map(Number);
+    const list = await backend.fetchOrders(new Date(y, m - 1, d).getTime(), new Date(y, m - 1, d + 1).getTime(), 1000);
+    if (seq !== h.seq) return;
+    h.orders = list;
+  } catch (e) {
+    console.error(e);
+    if (seq !== h.seq) return;
+    h.orders = null;
+    h.err = "Gagal memuat riwayat. Cek koneksi dan aturan Firestore.";
+  }
+  h.loading = false;
+  if (K.tab === "riwayat") renderKasir();
+}
+
+const csvCell = (v) => {
+  let t = String(v ?? "");
+  if (/^[=+\-@\t\r]/.test(t)) t = "'" + t; // cegah rumus Excel dari nama pelanggan
+  return '"' + t.replace(/"/g, '""') + '"';
+};
+
+function downloadCsv(name, list) {
+  const head = ["Tanggal", "Jam", "Kode", "Nama", "Meja", "Metode", "Status", "Pembayaran", "Total", "Item"];
+  const rows = [...list].sort((a, b) => ms(a.createdAt) - ms(b.createdAt)).map((o) => [
+    dateStr(new Date(ms(o.createdAt))), hhmm(o.createdAt), String(o.id).slice(-4).toUpperCase(), o.name || "", o.table || "",
+    METHODS[o.method] || o.method || "", STATUS[o.status || "baru"] || o.status, o.paid ? "Lunas" : "Belum bayar", o.total || 0,
+    (o.items || []).map((i) => `${i.qty}x ${i.name}`).join(", ")
+  ]);
+  const csv = "\ufeff" + [head, ...rows].map((r) => r.map(csvCell).join(";")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name + ".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function exportCsv(scope, btn) {
+  const h = K.hist;
+  const [y, m, d] = h.date.split("-").map(Number);
+  if (scope === "day") {
+    if (!h.orders || !h.orders.length) return;
+    downloadCsv("pesanan-" + h.date, h.orders);
+    return;
+  }
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Mengambil data...";
+  try {
+    const list = await backend.fetchOrders(new Date(y, m - 1, 1).getTime(), new Date(y, m, 1).getTime(), 4000);
+    if (!list.length) { alert("Tidak ada pesanan pada bulan itu."); }
+    else downloadCsv("pesanan-" + h.date.slice(0, 7), list);
+  } catch (e) {
+    console.error(e);
+    alert("Gagal mengambil data sebulan. Coba lagi.");
+  }
+  btn.disabled = false; btn.textContent = label;
+}
+
 function renderLogin(msg = "") {
   kasir.innerHTML = `<div class="wrap"><header><h1>Kasir</h1><div class="tag">${esc(CAFE.name)}</div>${demoNote()}</header>
     <form id="lf"><div class="row"><input id="em" type="email" placeholder="Email kasir" autocomplete="username" required></div>
@@ -1319,7 +1448,7 @@ function renderLogin(msg = "") {
 }
 
 function renderKasir() {
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const today = new Date(bizStart());
   const aktif = K.orders.filter((o) => o.status === "baru" || o.status === "diproses");
   const unpaid = aktif.filter((o) => !o.paid).length;
   const omzet = K.orders.filter((o) => o.paid && o.status !== "batal" && ms(o.createdAt) >= today.getTime()).reduce((a, o) => a + (o.total || 0), 0);
@@ -1346,6 +1475,7 @@ function renderKasir() {
   if (K.tab === "menu") body = menuEditorHtml();
   else if (K.tab === "pengaturan") body = settingsHtml();
   else if (K.tab === "qr") body = qrHtml();
+  else if (K.tab === "riwayat") body = histHtml();
   else body = shown.length ? shown.map(card).join("") : `<div class="empty">Belum ada pesanan.</div>`;
   const stats = EDIT_TABS.includes(K.tab) ? "" : `<div class="stats"><div class="stat">Pesanan aktif<b>${aktif.length}</b></div><div class="stat">Belum bayar<b>${unpaid}</b></div><div class="stat">Lunas hari ini<b>${rp(omzet)}</b></div></div>`;
   kasir.innerHTML = `<div class="wrap">
@@ -1417,6 +1547,7 @@ function initKasir() {
       K.tab = b.dataset.tab;
       if (K.tab === "pengaturan") K.stQris = K.settings.qris;
       renderKasir();
+      if (K.tab === "riwayat" && !K.hist.orders && !K.hist.loading) loadHist();
       return;
     }
     if (act === "sound") { K.sound = !K.sound; renderKasir(); return; }
@@ -1447,6 +1578,8 @@ function initKasir() {
       return;
     }
     if (act === "print") { window.print(); return; }
+    if (act === "histload") { await loadHist(); return; }
+    if (act === "csvday" || act === "csvmonth") { await exportCsv(act === "csvday" ? "day" : "month", b); return; }
     const patch = { lunas: { paid: true }, proses: { status: "diproses" }, selesai: { status: "selesai" }, batal: { status: "batal" } }[act];
     if (!patch) return;
     if (act === "batal" && !confirm("Batalkan pesanan ini?")) return;
@@ -1455,6 +1588,10 @@ function initKasir() {
   });
   kasir.addEventListener("change", (e) => {
     if (e.target.id === "stQrisFile") { onQrisPicked(e.target); return; }
+    if (e.target.id === "histDate") {
+      if (e.target.value) { K.hist.date = e.target.value; loadHist(); }
+      return;
+    }
     onMenuFieldChange(e);
   });
   backend.onAuth((ok) => {
