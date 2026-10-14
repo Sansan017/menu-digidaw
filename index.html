@@ -1369,7 +1369,7 @@ function histHtml() {
       ${r.unpaid ? `<div class="banner">Ada ${r.unpaid} pesanan yang belum dibayar dan tidak masuk omzet.</div>` : ""}
       <div class="card"><h2 style="margin:0 0 4px">Per metode bayar</h2>${methodLines}</div>
       <div class="card"><h2 style="margin:0 0 4px">Menu terlaris</h2>${topLines}</div>
-      <div class="acts" style="margin-top:12px"><button class="btn sm ghost" data-act="csvday">Ekspor CSV tanggal ini</button><button class="btn sm ghost" data-act="csvmonth">Ekspor CSV sebulan</button></div>
+      <div class="acts" style="margin-top:12px"><button class="btn sm ghost" data-act="csvday">Ekspor Excel tanggal ini</button><button class="btn sm ghost" data-act="csvmonth">Ekspor Excel sebulan</button></div>
       <h2>Daftar pesanan (${h.orders.length})</h2>${h.orders.map(histCardHtml).join("")}`;
   }
   return `<div class="muted" style="margin-bottom:8px">Rekap dihitung langsung dari data pesanan, jadi selalu cocok dengan catatan kasir. Omzet hanya menghitung pesanan yang sudah lunas dan tidak dibatalkan.</div>
@@ -1400,23 +1400,55 @@ async function loadHist() {
 
 const csvCell = (v) => {
   let t = String(v ?? "");
-  if (/^[=+\-@\t\r]/.test(t)) t = "'" + t; // cegah rumus Excel dari nama pelanggan
+  if (/^[=+\-@\t\r]/.test(t)) t = "'" + t; // cegah rumus dari nama pelanggan
   return '"' + t.replace(/"/g, '""') + '"';
 };
 
-function downloadCsv(name, list) {
+function orderRows(list) {
   const head = ["Tanggal", "Jam", "Kode", "Nama", "Meja", "Metode", "Status", "Pembayaran", "Total", "Item"];
   const rows = [...list].sort((a, b) => ms(a.createdAt) - ms(b.createdAt)).map((o) => [
     dateStr(new Date(ms(o.createdAt))), hhmm(o.createdAt), String(o.id).slice(-4).toUpperCase(), o.name || "", o.table || "",
-    METHODS[o.method] || o.method || "", STATUS[o.status || "baru"] || o.status, o.paid ? "Lunas" : "Belum bayar", o.total || 0,
+    METHODS[o.method] || o.method || "", STATUS[o.status || "baru"] || o.status, o.paid ? "Lunas" : "Belum bayar", Number(o.total) || 0,
     (o.items || []).map((i) => `${i.qty}x ${i.name}`).join(", ")
   ]);
-  const csv = "\ufeff" + [head, ...rows].map((r) => r.map(csvCell).join(";")).join("\r\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  return [head, ...rows];
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = name + ".csv";
+  a.href = url; a.download = filename;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function loadXlsx() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((resolve, reject) => {
+    const sc = document.createElement("script");
+    sc.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    sc.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error("xlsx")));
+    sc.onerror = () => reject(new Error("xlsx"));
+    document.head.appendChild(sc);
+  });
+}
+
+// File Excel (.xlsx) supaya kolom langsung rapi di Excel, WPS, maupun Google Sheets.
+// Kalau library gagal dimuat (offline), otomatis jatuh ke CSV berpemisah koma.
+async function downloadSheet(name, list) {
+  const aoa = orderRows(list);
+  try {
+    const X = await loadXlsx();
+    const ws = X.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{ wch: 12 }, { wch: 7 }, { wch: 7 }, { wch: 18 }, { wch: 7 }, { wch: 22 }, { wch: 18 }, { wch: 13 }, { wch: 11 }, { wch: 60 }];
+    const wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, ws, "Pesanan");
+    X.writeFile(wb, name + ".xlsx");
+  } catch (e) {
+    console.error(e);
+    const csv = "\ufeff" + aoa.map((r) => r.map(csvCell).join(",")).join("\r\n");
+    saveBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), name + ".csv");
+  }
 }
 
 async function exportCsv(scope, btn) {
@@ -1424,7 +1456,7 @@ async function exportCsv(scope, btn) {
   const [y, m, d] = h.date.split("-").map(Number);
   if (scope === "day") {
     if (!h.orders || !h.orders.length) return;
-    downloadCsv("pesanan-" + h.date, h.orders);
+    await downloadSheet("pesanan-" + h.date, h.orders);
     return;
   }
   const label = btn.textContent;
@@ -1432,7 +1464,7 @@ async function exportCsv(scope, btn) {
   try {
     const list = await backend.fetchOrders(new Date(y, m - 1, 1).getTime(), new Date(y, m, 1).getTime(), 4000);
     if (!list.length) { alert("Tidak ada pesanan pada bulan itu."); }
-    else downloadCsv("pesanan-" + h.date.slice(0, 7), list);
+    else await downloadSheet("pesanan-" + h.date.slice(0, 7), list);
   } catch (e) {
     console.error(e);
     alert("Gagal mengambil data sebulan. Coba lagi.");
